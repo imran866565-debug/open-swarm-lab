@@ -1,0 +1,8 @@
+vendor/
+models/
+results/model-chunks/
+results/model-chunks-corrupt/
+results/model-rebuilt.gguf
+__pycache__/
+*.pyc
+.pytest_cache/
