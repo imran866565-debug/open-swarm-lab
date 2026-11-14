@@ -39,9 +39,13 @@ from swarm.client import ask as client_ask  # noqa: E402
 
 # ---- pinned dependencies (change only with a reason, in the commit) ----
 LLAMA_CPP_REF = os.environ.get("LLAMA_CPP_REF", "v1.0.0")
-LLAMA_CPP_REPO = "https://github.com/ggerganov/llama.cpp.git"
+LLAMA_CPP_REPO = "https://github.com/ggml-org/llama.cpp.git"
+# Pinned HF revision (verified 2026-11-14 via HF API): the exact Q4_K_M file.
 MODEL_URL = ("https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/"
-             "resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf")
+             "resolve/9217f5db79a29953eb74d5343926648285ec7e67/"
+             "qwen2.5-0.5b-instruct-q4_k_m.gguf")
+MODEL_SHA256 = "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
+MODEL_SIZE = 491400032
 MODEL_NAME = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
 MODEL_LAYERS = 24
 RPC_PORTS = [50052, 50053, 50054]
@@ -190,18 +194,23 @@ class Experiment:
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
         if self.args.skip_download and os.path.exists(self.model_path):
             log("model download skipped (file present)")
-        elif os.path.exists(self.model_path) and os.path.getsize(self.model_path) > 100_000_000:
-            log("model already present, skipping download")
+        elif os.path.exists(self.model_path) and os.path.getsize(self.model_path) == MODEL_SIZE:
+            log("model already present (size matches pinned file), skipping download")
         else:
-            log("downloading Qwen2.5-0.5B Q4_K_M (~350 MB) ...")
+            log("downloading Qwen2.5-0.5B Q4_K_M (491,400,032 bytes) ...")
             dl = download(MODEL_URL, self.model_path)
             self.results["model"]["download"] = dl
             log(f"downloaded {dl['bytes']} bytes sha256={dl['sha256'][:16]}…")
         size = os.path.getsize(self.model_path)
+        digest = sha256_file(self.model_path)
         self.results["model"].update({"path": self.model_path, "size_bytes": size,
-                                     "sha256": sha256_file(self.model_path)})
-        ok = size > 100_000_000
-        log(f"model ok={ok} size={size} bytes")
+                                     "sha256": digest,
+                                     "expected_sha256": MODEL_SHA256,
+                                     "sha256_match": digest == MODEL_SHA256,
+                                     "expected_size_bytes": MODEL_SIZE})
+        ok = size == MODEL_SIZE and digest == MODEL_SHA256
+        log(f"model ok={ok} size={size} (expected {MODEL_SIZE}) "
+            f"sha_match={digest == MODEL_SHA256}")
         return ok
 
     def start_swarm(self):
@@ -308,9 +317,17 @@ class Experiment:
             part = rpc_mod.participation_evidence(rpc_logs, last_log or "")
             self.results["distribution"] = part
             all_ok = all(d["ok"] and len(d["output"]) > 10 for d in dist_results)
+            # Primary proof = client log's per-RPC model-buffer lines
+            # (3 non-zero RPC buffers). Server-log activity is secondary.
+            dist_proven = bool(part.get("distributed_by_client_log"))
             tests["D_distribution"] = {
-                "status": "PASS" if part["all_participated"] else "FAIL",
-                "evidence": json.dumps(part, default=str)[:1500]}
+                "status": "PASS" if dist_proven else "FAIL",
+                "evidence": json.dumps({
+                    "offloaded_layers": part.get("offloaded_layers"),
+                    "rpc_model_buffers_mib": part.get("rpc_model_buffers_mib"),
+                    "cpu_model_buffer_mib": part.get("cpu_model_buffer_mib"),
+                    "servers_participated": part.get("all_participated")},
+                    default=str)[:800]}
             tests["E_tasks"] = {
                 "status": "PASS" if all_ok else "FAIL",
                 "evidence": f"{sum(1 for d in dist_results if d['ok'])}/3 prompts returned real model output"}

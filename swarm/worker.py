@@ -79,7 +79,9 @@ class Worker:
             out = self.rpc_log_fh
         else:
             out = subprocess.DEVNULL
-        self.rpc_proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT)
+        env = dict(os.environ, GGML_RPC_DEBUG="1")
+        self.rpc_proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT,
+                                         env=env)
         # wait until it answers / is listening (up to 30 s)
         for _ in range(60):
             if self.rpc_proc.poll() is not None:

@@ -37,7 +37,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y build-essential cmake git curl
+          sudo apt-get install -y build-essential cmake git curl libcurl4-openssl-dev
 
       - name: Fast unit tests (no model)
         run: python -m unittest discover -s tests -v

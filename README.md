@@ -38,10 +38,14 @@ self-hosted runners).
 **Distribution honesty rule:** a copy of the full model on every worker
 would *not* count. Here the model weights are split by llama.cpp's RPC
 backend: `llama-cli --rpc 127.0.0.1:50052,127.0.0.1:50053,127.0.0.1:50054
--ngl 99` offloads transformer layers across the three `llama-rpc-server`
-processes. Participation is proven from the RPC servers' own logs and the
-client log (recorded in `results/metrics.json` under `distribution`), plus
-a single-node baseline for comparison. If a run cannot show that evidence,
+-ngl 99 --split-mode layer --device RPC0,RPC1,RPC2 --tensor-split 1,1,1`
+offloads transformer layers across the three RPC server processes
+(`llama-rpc-server` / `ggml-rpc-server`, name changed across versions).
+The `--device` + `--tensor-split 1,1,1` flags matter: without them the
+client's local CPU also takes a share. Participation is proven from the
+client log's per-RPC `model buffer size` lines (recorded in
+`results/metrics.json` under `distribution`), plus a single-node baseline
+for comparison. If a run cannot show that evidence,
 test D is marked FAIL — never faked.
 
 ## Architecture
@@ -63,7 +67,8 @@ worker-2 ── llama-rpc-server 127.0.0.1:50054 ┘   -ngl 99  (layers split)
 ```
 
 - **Model:** `Qwen/Qwen2.5-0.5B-Instruct-GGUF`, `Q4_K_M`
-  (~0.5B params, 24 layers), downloaded from Hugging Face at run time.
+  (0.49B params, 24 layers, 491,400,032 bytes, SHA-256 pinned in
+  `scripts/run_experiment.py`), downloaded from Hugging Face at run time.
 - **Runtime:** llama.cpp, pinned ref `v1.0.0`, built with `-DGGML_RPC=ON`.
 - **Code:** pure-stdlib Python 3.10+ — no pip dependencies, no paid APIs,
   no cloud databases.
