@@ -287,7 +287,9 @@ class Experiment:
 
             # --- distributed inference (3 prompts) ----------------------
             log("distributed: 3 prompts through the 3-node pool ...")
-            sampler = mon.Sampler(interval=0.5)
+            live_pids = [p.pid for p in self.procs.values()
+                         if p.poll() is None]
+            sampler = mon.Sampler(interval=0.5, pids=live_pids)
             sampler.start()
             net0 = mon.net_lo_bytes()
             dist_results = []
@@ -312,22 +314,43 @@ class Experiment:
                 "net_lo_tx_bytes_distributed_phase": net1["tx_bytes"] - net0["tx_bytes"],
             }
             rpc_logs = [os.path.join(self.logs_dir, f"rpc-{i}.log") for i in range(3)]
-            last_log = dist_results[-1] and open(
-                os.path.join(self.logs_dir, "distributed-3.log")).read()
-            part = rpc_mod.participation_evidence(rpc_logs, last_log or "")
+            # Distribution probe: one short inference at -lv 5. Its debug
+            # lines interleave with generated text, so its output is
+            # DISCARDED — only its log matters: it prints the exact
+            # per-layer device assignment (e.g. RPC0: layers 0-8,
+            # RPC1: 9-16, RPC2: 17-23). Answer runs stay at default
+            # verbosity so their output stays clean.
+            log("distribution probe: -lv 5 layer-assignment capture ...")
+            probe = rpc_mod.run_inference(
+                cli_bin, self.model_path, "Say hi.",
+                rpc_servers=[f"127.0.0.1:{p}" for p in RPC_PORTS],
+                max_tokens=8, timeout=300, log_verbosity=5)
+            with open(os.path.join(self.logs_dir, "probe-distribution.log"), "w") as f:
+                f.write(probe.get("log", ""))
+            self.results["distribution_probe"] = {
+                "ok": probe["ok"], "elapsed_s": probe.get("elapsed_s")}
+            part = rpc_mod.participation_evidence(rpc_logs, probe.get("log", ""))
             self.results["distribution"] = part
             all_ok = all(d["ok"] and len(d["output"]) > 10 for d in dist_results)
-            # Primary proof = client log's per-RPC model-buffer lines
-            # (3 non-zero RPC buffers). Server-log activity is secondary.
-            dist_proven = bool(part.get("distributed_by_client_log"))
+            # Primary proof = client log's per-RPC model-buffer lines,
+            # the -lv 5 layer-assignment lines, OR every RPC server's own
+            # graph_compute evidence (v1.0.0 client log is silent about
+            # buffers at default verbosity — see swarm/rpc.py).
+            dist_proven = bool(part.get("distribution_proven"))
             tests["D_distribution"] = {
                 "status": "PASS" if dist_proven else "FAIL",
                 "evidence": json.dumps({
+                    "proof": part.get("proof"),
+                    "layer_split": part.get("layer_split"),
+                    "layers_covered": part.get("layers_covered"),
                     "offloaded_layers": part.get("offloaded_layers"),
                     "rpc_model_buffers_mib": part.get("rpc_model_buffers_mib"),
                     "cpu_model_buffer_mib": part.get("cpu_model_buffer_mib"),
-                    "servers_participated": part.get("all_participated")},
-                    default=str)[:800]}
+                    "server_graph_computes": {
+                        k: v.get("graph_computes")
+                        for k, v in part.get("servers", {}).items()},
+                    "servers_computed": part.get("servers_computed")},
+                    default=str)[:900]}
             tests["E_tasks"] = {
                 "status": "PASS" if all_ok else "FAIL",
                 "evidence": f"{sum(1 for d in dist_results if d['ok'])}/3 prompts returned real model output"}

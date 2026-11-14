@@ -88,7 +88,25 @@ def find_bin(build_dir: str, name: str) -> str | None:
     return None
 
 
-def parse_tokens_per_s(stderr_text: str) -> float | None:
+def parse_layer_assignment(log_text: str) -> dict:
+    """Parse v1.0.0 `-lv 5` lines: `layer N assigned to device RPCk`.
+
+    Returns {"RPC0": [0..8], "RPC1": [9..16], "RPC2": [17..23]} style
+    mapping plus counts. Empty when the log has no such lines (default
+    verbosity). This is the exact per-layer split — the strongest
+    distribution proof available.
+    """
+    assign: dict[str, list[int]] = {}
+    for layer, dev in re.findall(r"layer\s+(\d+)\s+assigned to device\s+(RPC\d+)",
+                                 log_text):
+        assign.setdefault(dev, []).append(int(layer))
+    for dev in assign:
+        assign[dev] = sorted(set(assign[dev]))
+    return assign
+    # v1.0.0 chat UI: "[ Prompt: 65.7 t/s | Generation: 10.3 t/s ]"
+    m = re.search(r"Generation:\s*([\d.]+)\s*t/s", stderr_text)
+    if m:
+        return float(m.group(1))
     m = re.search(r"eval time.*?([\d.]+)\s*ms\s*/\s*(\d+)\s*runs.*?([\d.]+)\s*tokens per second",
                   stderr_text, re.S)
     if m:
@@ -100,11 +118,19 @@ def parse_tokens_per_s(stderr_text: str) -> float | None:
 def run_inference(cli_bin: str, model_path: str, prompt: str,
                   rpc_servers: list[str] | None = None,
                   max_tokens: int = 128, seed: int = 42,
-                  timeout: int = 600) -> dict:
-    """Run one real inference. Returns metrics + raw logs (never faked)."""
+                  timeout: int = 600, log_verbosity: int | None = None) -> dict:
+    """Run one real inference. Returns metrics + raw logs (never faked).
+
+    ``log_verbosity`` (e.g. 5) is for EVIDENCE PROBES ONLY: at -lv 5 the
+    client prints the exact per-layer device assignment, but its debug
+    lines interleave with the generated text, so answer runs must keep
+    default verbosity.
+    """
     cmd = [cli_bin, "-m", model_path, "-p", prompt, "-n", str(max_tokens),
            "--seed", str(seed), "--temp", "0.7", "--no-display-prompt",
            "-c", "2048"]
+    if log_verbosity is not None:
+        cmd += ["-lv", str(log_verbosity)]
     if rpc_servers:
         # Pure 3-way split: WITHOUT --device the client's local CPU also
         # takes a share (~1/4 each). --device must come AFTER --rpc.
@@ -135,17 +161,39 @@ def run_inference(cli_bin: str, model_path: str, prompt: str,
 
 
 def extract_completion(text: str) -> str:
-    """Best-effort extraction of the generated text from llama-cli output."""
-    # Cut the llama.cpp timing / perf footer.
+    """Extract the generated answer from llama-cli output.
+
+    v1.0.0 runs an interactive chat UI: banner + ASCII art, then
+    "> <prompt>" echo, the answer, then "[ Prompt: .. | Generation: .. ]".
+    The answer is the slice between the prompt echo and the timing line.
+    Falls back to the old banner-stripping heuristic when those markers
+    are absent (older llama.cpp).
+    """
+    lines = text.splitlines()
+    start = end = None
+    for i, ln in enumerate(lines):
+        if start is None and ln.startswith("> "):
+            start = i + 1
+        elif start is not None and "[ Prompt:" in ln:
+            end = i
+            break
+    if start is not None and end is not None and end > start:
+        return "\n".join(lines[start:end]).strip()
+    if start is not None:
+        # No timing line (e.g. run cut short): take everything after echo,
+        # dropping trailing UI lines.
+        body = [ln for ln in lines[start:]
+                if ln.strip() and ln.strip() not in (">", "Exiting...")]
+        return "\n".join(body).strip()
+    # Fallback: cut the llama.cpp timing / perf footer, drop header lines.
     cut = re.split(r"\nllama_perf_|^\s*perf\s", text, flags=re.M | re.S)
     body = cut[0]
-    # Drop the common llama-cli header lines.
-    lines = [ln for ln in body.splitlines()
-             if not ln.startswith(("llama_model_loader", "llama_context",
+    kept = [ln for ln in body.splitlines()
+            if not ln.startswith(("llama_model_loader", "llama_context",
                                   "system_info", "print_info", "load_backend",
                                   "llama_", "common_", "main: ", "sampler",
                                   "generate:", "build:", "commit:", "ggml_"))]
-    return "\n".join(lines).strip()
+    return "\n".join(kept).strip()
 
 
 def participation_evidence(rpc_log_paths: list[str], client_log: str) -> dict:
@@ -154,11 +202,13 @@ def participation_evidence(rpc_log_paths: list[str], client_log: str) -> dict:
     PRIMARY evidence lives in the CLIENT log (upstream llama.cpp):
       load_tensors: offloaded 24/24 layers to GPU
       load_tensors: RPC0[127.0.0.1:50052] model buffer size = ~160 MiB
-      load_tensors: RPC1[127.0.0.1:50053] model buffer size = ~160 MiB
-      load_tensors: RPC2[127.0.0.1:50054] model buffer size = ~160 MiB
-    Three non-zero RPC buffer lines = the model really is split across
-    the three workers. All weight on CPU (or one line only) = FAIL.
-    Server logs are secondary (banner + GGML_RPC_DEBUG activity).
+    BUT llama.cpp v1.0.0's llama-cli does not print those lines at
+    default verbosity. Independent SECONDARY proof: every RPC server's
+    own log shows the client handshake ([hello] + rpc_serve_client) and
+    repeated [graph_compute] executions (n_nodes/n_tensors per compute)
+    — a server that never received tensors cannot compute graphs.
+    D passes on EITHER proof, and records which one fired, so a silent
+    client log can never hide a real distribution — nor fake one.
     """
     per_server = {}
     for path in rpc_log_paths:
@@ -185,12 +235,25 @@ def participation_evidence(rpc_log_paths: list[str], client_log: str) -> dict:
     rpc_mentioned = re.findall(r"127\.0\.0\.1:\d+", client_log)
     distributed = (len(rpc_buffers) >= 3
                    and all(float(v["mib"].lstrip("~")) > 0 for v in rpc_buffers.values()))
+    layer_assignment = parse_layer_assignment(client_log)
+    layers_covered = sorted(l for layers in layer_assignment.values() for l in layers)
+    layer_split_proven = (len(layer_assignment) >= 3
+                          and len(layers_covered) >= 24)
+    servers_computed = bool(per_server) and all(
+        v.get("participated") for v in per_server.values())
     return {"servers": per_server,
             "client_log_markers": client_markers,
             "client_log_rpc_endpoints": sorted(set(rpc_mentioned)),
             "offloaded_layers": offloaded.groups() if offloaded else None,
             "rpc_model_buffers_mib": rpc_buffers,
             "cpu_model_buffer_mib": cpu_buf.group(1) if cpu_buf else None,
-            "distributed_by_client_log": distributed,
-            "all_participated": bool(per_server) and all(
-                v.get("participated") for v in per_server.values())}
+            "layer_assignment": layer_assignment,
+            "layer_split": {k: len(v) for k, v in layer_assignment.items()},
+            "layers_covered": len(layers_covered),
+            "distributed_by_client_log": distributed or layer_split_proven,
+            "servers_computed": servers_computed,
+            "distribution_proven": distributed or layer_split_proven or servers_computed,
+            "proof": ("client_log_buffers" if distributed else
+                      "layer_assignment" if layer_split_proven else
+                      "server_graph_compute" if servers_computed else "none"),
+            "all_participated": servers_computed}

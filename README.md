@@ -42,10 +42,14 @@ backend: `llama-cli --rpc 127.0.0.1:50052,127.0.0.1:50053,127.0.0.1:50054
 offloads transformer layers across the three RPC server processes
 (`llama-rpc-server` / `ggml-rpc-server`, name changed across versions).
 The `--device` + `--tensor-split 1,1,1` flags matter: without them the
-client's local CPU also takes a share. Participation is proven from the
-client log's per-RPC `model buffer size` lines (recorded in
-`results/metrics.json` under `distribution`), plus a single-node baseline
-for comparison. If a run cannot show that evidence,
+client's local CPU also takes a share. Participation is proven two ways
+(recorded in `results/metrics.json` under `distribution`): the client
+log's per-RPC `model buffer size` lines when the client prints them, and
+— since llama.cpp v1.0.0's `llama-cli` stays silent about them at default
+verbosity — every RPC server's own log showing the client handshake plus
+repeated `[graph_compute]` executions (`n_nodes`/`n_tensors` per compute).
+A server that never received tensors cannot compute graphs. If neither
+proof fires, test D is marked FAIL — never faked.
 test D is marked FAIL — never faked.
 
 ## Architecture
