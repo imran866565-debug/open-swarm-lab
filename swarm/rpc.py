@@ -103,6 +103,9 @@ def parse_layer_assignment(log_text: str) -> dict:
     for dev in assign:
         assign[dev] = sorted(set(assign[dev]))
     return assign
+
+
+def parse_tokens_per_s(stderr_text: str) -> float | None:
     # v1.0.0 chat UI: "[ Prompt: 65.7 t/s | Generation: 10.3 t/s ]"
     m = re.search(r"Generation:\s*([\d.]+)\s*t/s", stderr_text)
     if m:
